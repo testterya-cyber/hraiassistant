@@ -33,6 +33,51 @@ function joinList(items) { return (items || []).join('\n'); }
 function splitList(value) { return value.split('\n').map((item) => item.trim()).filter(Boolean); }
 function formatStamp(value) { return value ? new Date(value).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''; }
 
+function escapeHtml(value) {
+  return safeText(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderList(items) {
+  if (!items || items.length === 0) return '<p>Не указано</p>';
+  return `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`;
+}
+
+function downloadWordDocument(filename, title, sections) {
+  const html = `<!DOCTYPE html>
+  <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>${escapeHtml(title)}</title>
+      <style>
+        body { font-family: Arial, sans-serif; color: #111827; padding: 24px; line-height: 1.5; }
+        h1 { font-size: 24px; margin-bottom: 16px; }
+        h2 { font-size: 18px; margin-top: 24px; margin-bottom: 8px; }
+        p { margin: 6px 0; }
+        ul { margin: 6px 0 6px 20px; }
+      </style>
+    </head>
+    <body>
+      <h1>${escapeHtml(title)}</h1>
+      ${sections.map((section) => `<h2>${escapeHtml(section.title)}</h2>${section.body}`).join('')}
+    </body>
+  </html>`;
+
+  const blob = new Blob(['\ufeff', html], { type: 'application/msword' });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.URL.revokeObjectURL(url);
+}
+
 function extractJson(text) {
   const cleaned = safeText(text).replace(/```json|```/gi, '');
   const start = cleaned.indexOf('{');
@@ -150,6 +195,20 @@ export default function AssistantSupabase({ onLogout }) {
   const selectedInterviewProfile = useMemo(() => profiles.find((item) => item.id === selectedInterviewProfileId) || null, [profiles, selectedInterviewProfileId]);
   const resumeOptions = useMemo(() => resumes.map((item) => ({ value: item.id, label: `${item.candidateName || 'Без имени'}${item.position ? ` · ${item.position}` : ''}` })), [resumes]);
   const profileOptions = useMemo(() => profiles.map((item) => ({ value: item.id, label: `${item.title || 'Без названия'}${item.department ? ` · ${item.department}` : ''}` })), [profiles]);
+  const candidateSummary = useMemo(() => ({
+    fullName: selectedResume?.candidateName || resumeDraft.candidateName || '',
+    position: selectedResume?.position || resumeDraft.position || '',
+    city: selectedResume?.city || resumeDraft.city || '',
+    salary: selectedResume?.salaryExpectation || resumeDraft.salaryExpectation || '',
+    summary: selectedResume?.summary || resumeDraft.summary || '',
+    skills: (selectedResume?.skills && selectedResume.skills.length ? selectedResume.skills : resumeDraft.skills) || [],
+    verdict: scoreResult.verdict || '',
+    score: scoreResult.overallScore || 0,
+    recommendations: scoreResult.pros || [],
+    risks: scoreResult.cons || [],
+    interviewNotes: scoreResult.questionsToClarify || [],
+    hrNotes: scoreNotes || '',
+  }), [resumeDraft, scoreNotes, scoreResult, selectedResume]);
 
   const withFeedback = useCallback(async (action, okMessage) => {
     setLoading(true); setError(''); setSuccess('');
@@ -257,6 +316,49 @@ export default function AssistantSupabase({ onLogout }) {
   const handleScoreAnalyze = async () => { if (!selectedResume || !selectedProfile) return; await withFeedback(async () => { const raw = await callClaude(promptScore(selectedResume, selectedProfile, scoreNotes)); setScoreResult(normalizeScore(extractJson(raw))); }, 'Оценка кандидата готова.'); };
   const handleInterviewAnalyze = async () => { if (!selectedInterviewProfile) return; await withFeedback(async () => { const raw = await callClaude(promptInterview(selectedInterviewProfile, selectedInterviewResume, interviewNotes)); setInterviewResult(normalizeInterview(extractJson(raw))); }, 'Вопросы для интервью подготовлены.'); };
 
+  const exportInterviewToWord = useCallback(() => {
+    if (!selectedInterviewProfile && interviewResult.competency.length === 0) {
+      setError('Сначала сгенерируй вопросы для интервью.');
+      return;
+    }
+    downloadWordDocument(
+      `interview-${safeText(selectedInterviewProfile?.title || 'profile')}.doc`,
+      `Вопросы для интервью: ${selectedInterviewProfile?.title || 'Профиль должности'}`,
+      [
+        { title: 'Профиль должности', body: `<p>${escapeHtml(selectedInterviewProfile?.title || 'Не указан')}</p>` },
+        { title: 'Кандидат', body: `<p>${escapeHtml(selectedInterviewResume?.candidateName || 'Не выбран')}</p>` },
+        { title: 'Компетентностные вопросы', body: interviewResult.competency.length ? `<ul>${interviewResult.competency.map((item) => `<li><strong>${escapeHtml(item.competency || 'Компетенция')}:</strong> ${escapeHtml(item.question)}<br/>Что искать: ${escapeHtml(item.whatLookingFor || 'Не указано')}</li>`).join('')}</ul>` : '<p>Не указано</p>' },
+        { title: 'Ситуационные вопросы', body: renderList(interviewResult.situational) },
+        { title: 'Технические вопросы', body: renderList(interviewResult.technical) },
+        { title: 'Мотивация', body: renderList(interviewResult.motivation) },
+        { title: 'Закрывающие вопросы', body: renderList(interviewResult.closing) },
+      ]
+    );
+  }, [interviewResult, selectedInterviewProfile, selectedInterviewResume]);
+
+  const exportSummaryToWord = useCallback(() => {
+    if (!candidateSummary.fullName && !candidateSummary.summary) {
+      setError('Сначала выбери кандидата и сформируй оценку.');
+      return;
+    }
+    downloadWordDocument(
+      `candidate-summary-${safeText(candidateSummary.fullName || 'candidate')}.doc`,
+      `Итоговое саммари кандидата: ${candidateSummary.fullName || 'Кандидат'}`,
+      [
+        { title: 'ФИО кандидата', body: `<p>${escapeHtml(candidateSummary.fullName || 'Не указано')}</p>` },
+        { title: 'Желаемая должность', body: `<p>${escapeHtml(candidateSummary.position || 'Не указано')}</p>` },
+        { title: 'Город и ожидания по зарплате', body: `<p>${escapeHtml(candidateSummary.city || 'Не указан')} ${candidateSummary.salary ? `| ${escapeHtml(candidateSummary.salary)}` : ''}</p>` },
+        { title: 'Краткое описание', body: `<p>${escapeHtml(candidateSummary.summary || 'Не указано')}</p>` },
+        { title: 'Навыки', body: renderList(candidateSummary.skills) },
+        { title: 'Оценка и вердикт', body: `<p><strong>${escapeHtml(candidateSummary.verdict || 'Не рассчитан')}</strong> | ${escapeHtml(String(candidateSummary.score || 0))}/100</p>` },
+        { title: 'Рекомендации', body: renderList(candidateSummary.recommendations) },
+        { title: 'Риски', body: renderList(candidateSummary.risks) },
+        { title: 'Что уточнить на интервью', body: renderList(candidateSummary.interviewNotes) },
+        { title: 'Заметки HR', body: `<p>${escapeHtml(candidateSummary.hrNotes || 'Не указано')}</p>` },
+      ]
+    );
+  }, [candidateSummary]);
+
   return (
     <div style={{ minHeight: '100vh', background: 'linear-gradient(180deg, #f8fafc 0%, #eef4ff 100%)', color: '#0f172a' }}>
       <div style={{ borderBottom: '1px solid #e2e8f0', background: 'rgba(255,255,255,0.92)', position: 'sticky', top: 0, zIndex: 5 }}>
@@ -282,17 +384,16 @@ export default function AssistantSupabase({ onLogout }) {
           <div style={{ display: 'grid', gap: 16 }}>
             {activeTab === 'parse' ? <><Card title="Анализ резюме" subtitle="Загрузка PDF, анализ Claude и сохранение в Supabase"><div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}><input ref={fileRef} type="file" accept=".pdf" onChange={handleFile} style={{ display: 'none' }} /><button onClick={() => fileRef.current?.click()} style={secondaryButton}>{pdfName ? `PDF: ${pdfName}` : 'Загрузить PDF'}</button><button onClick={handleResumeAnalyze} disabled={loading || !resumeText.trim()} style={{ ...secondaryButton, borderColor: tone.accent, color: tone.color }}>Анализировать</button><button onClick={saveResume} disabled={loading || (!resumeDraft.candidateName && !resumeDraft.summary)} style={secondaryButton}>Сохранить</button></div><Area label="Текст резюме" value={resumeText} onChange={setResumeText} minHeight={260} /></Card><Card title="Редактирование карточки кандидата"><div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}><Field label="ФИО" value={resumeDraft.candidateName} onChange={(value) => setResumeDraft((prev) => ({ ...prev, candidateName: value }))} /><Field label="Должность" value={resumeDraft.position} onChange={(value) => setResumeDraft((prev) => ({ ...prev, position: value }))} /><Field label="Город" value={resumeDraft.city} onChange={(value) => setResumeDraft((prev) => ({ ...prev, city: value }))} /><Field label="Ожидаемая зарплата" value={resumeDraft.salaryExpectation} onChange={(value) => setResumeDraft((prev) => ({ ...prev, salaryExpectation: value }))} /><Area label="Краткая сводка" value={resumeDraft.summary} onChange={(value) => setResumeDraft((prev) => ({ ...prev, summary: value }))} minHeight={120} /><Area label="Навыки" value={joinList(resumeDraft.skills)} onChange={(value) => setResumeDraft((prev) => ({ ...prev, skills: splitList(value) }))} minHeight={120} /></div></Card></> : null}
             {activeTab === 'profile' ? <><Card title="Профиль должности" subtitle="Достаточно ввести название должности, а сайт сам создаст черновик профиля под редактирование"><div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}><button onClick={handleProfileAnalyze} disabled={loading || !profileText.trim()} style={{ ...secondaryButton, borderColor: tone.accent, color: tone.color }}>Создать черновик профиля</button><button onClick={saveProfile} disabled={loading || (!profileDraft.title && !profileDraft.purpose)} style={secondaryButton}>Сохранить профиль</button></div><Area label="Название должности или короткий контекст" value={profileText} onChange={setProfileText} minHeight={220} placeholder="Например: HR директор" /></Card><Card title="Редактирование профиля"><div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}><Field label="Название должности" value={profileDraft.title} onChange={(value) => setProfileDraft((prev) => ({ ...prev, title: value }))} /><Field label="Департамент" value={profileDraft.department} onChange={(value) => setProfileDraft((prev) => ({ ...prev, department: value }))} /><Field label="Уровень" value={profileDraft.level} onChange={(value) => setProfileDraft((prev) => ({ ...prev, level: value }))} /><Field label="Вилка зарплаты" value={profileDraft.salaryRange} onChange={(value) => setProfileDraft((prev) => ({ ...prev, salaryRange: value }))} /><Area label="Цель роли" value={profileDraft.purpose} onChange={(value) => setProfileDraft((prev) => ({ ...prev, purpose: value }))} minHeight={120} /><Area label="Must have" value={joinList(profileDraft.mustHave)} onChange={(value) => setProfileDraft((prev) => ({ ...prev, mustHave: splitList(value) }))} minHeight={120} /></div></Card></> : null}
-            {activeTab === 'score' ? <Card title="Оценка кандидата" subtitle="Выбор кандидата и профиля из базы"><div style={{ display: 'grid', gap: 12 }}><div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}><Select label="Кандидат" value={selectedResumeId} onChange={setSelectedResumeId} options={resumeOptions} placeholder="Выбери кандидата" /><Select label="Профиль" value={selectedProfileId} onChange={setSelectedProfileId} options={profileOptions} placeholder="Выбери профиль" /></div><Area label="Заметки HR" value={scoreNotes} onChange={setScoreNotes} minHeight={120} /><div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}><button onClick={handleScoreAnalyze} disabled={loading || !selectedResume || !selectedProfile} style={{ ...secondaryButton, borderColor: tone.accent, color: tone.color }}>Оценить</button><button onClick={saveScore} disabled={loading || !scoreResult.verdict} style={secondaryButton}>Сохранить оценку</button></div><div style={{ padding: 16, borderRadius: 16, background: '#f8fafc', border: '1px solid #e2e8f0' }}><div style={{ fontSize: 32, fontWeight: 800, color: tone.color }}>{scoreResult.overallScore || 0}</div><div style={{ marginTop: 8, fontWeight: 700 }}>{scoreResult.verdict || 'Вердикт ещё не рассчитан'}</div><div style={{ marginTop: 6, color: '#64748b', fontSize: 14 }}>{scoreResult.verdictReason || 'После анализа здесь появится краткое объяснение.'}</div></div></div></Card> : null}
-            {activeTab === 'interview' ? <Card title="Вопросы для интервью" subtitle="Профиль должности и кандидат подтягиваются из базы"><div style={{ display: 'grid', gap: 12 }}><div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}><Select label="Профиль" value={selectedInterviewProfileId} onChange={setSelectedInterviewProfileId} options={profileOptions} placeholder="Выбери профиль" /><Select label="Кандидат" value={selectedInterviewResumeId} onChange={setSelectedInterviewResumeId} options={resumeOptions} placeholder="Необязательно" /></div><Area label="Фокус интервью" value={interviewNotes} onChange={setInterviewNotes} minHeight={120} /><div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}><button onClick={handleInterviewAnalyze} disabled={loading || !selectedInterviewProfile} style={{ ...secondaryButton, borderColor: tone.accent, color: tone.color }}>Сгенерировать</button><button onClick={saveInterview} disabled={loading || !selectedInterviewProfile} style={secondaryButton}>Сохранить набор</button></div><div>{interviewResult.competency.map((item, index) => <div key={`${item.question}-${index}`} style={{ padding: 12, borderRadius: 14, background: '#f8fafc', border: '1px solid #e2e8f0', marginBottom: 10 }}><div style={{ fontSize: 12, color: tone.color, fontWeight: 700 }}>{item.competency || 'Компетенция'}</div><div style={{ marginTop: 6, fontWeight: 700 }}>{item.question || 'Вопрос не указан'}</div><div style={{ marginTop: 4, fontSize: 13, color: '#64748b' }}>{item.whatLookingFor || 'Подсказка не указана'}</div></div>)}</div></div></Card> : null}
+            {activeTab === 'score' ? <Card title="Оценка кандидата" subtitle="Выбор кандидата и профиля из базы"><div style={{ display: 'grid', gap: 12 }}><div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}><Select label="Кандидат" value={selectedResumeId} onChange={setSelectedResumeId} options={resumeOptions} placeholder="Выбери кандидата" /><Select label="Профиль" value={selectedProfileId} onChange={setSelectedProfileId} options={profileOptions} placeholder="Выбери профиль" /></div><Area label="Заметки HR" value={scoreNotes} onChange={setScoreNotes} minHeight={120} /><div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}><button onClick={handleScoreAnalyze} disabled={loading || !selectedResume || !selectedProfile} style={{ ...secondaryButton, borderColor: tone.accent, color: tone.color }}>Оценить</button><button onClick={saveScore} disabled={loading || !scoreResult.verdict} style={secondaryButton}>Сохранить оценку</button><button onClick={exportSummaryToWord} disabled={loading || (!candidateSummary.fullName && !candidateSummary.summary)} style={secondaryButton}>Скачать саммари в Word</button></div><div style={{ padding: 16, borderRadius: 16, background: '#f8fafc', border: '1px solid #e2e8f0' }}><div style={{ fontSize: 32, fontWeight: 800, color: tone.color }}>{scoreResult.overallScore || 0}</div><div style={{ marginTop: 8, fontWeight: 700 }}>{scoreResult.verdict || 'Вердикт ещё не рассчитан'}</div><div style={{ marginTop: 6, color: '#64748b', fontSize: 14 }}>{scoreResult.verdictReason || 'После анализа здесь появится краткое объяснение.'}</div></div></div></Card> : null}
+            {activeTab === 'interview' ? <Card title="Вопросы для интервью" subtitle="Профиль должности и кандидат подтягиваются из базы"><div style={{ display: 'grid', gap: 12 }}><div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}><Select label="Профиль" value={selectedInterviewProfileId} onChange={setSelectedInterviewProfileId} options={profileOptions} placeholder="Выбери профиль" /><Select label="Кандидат" value={selectedInterviewResumeId} onChange={setSelectedInterviewResumeId} options={resumeOptions} placeholder="Необязательно" /></div><Area label="Фокус интервью" value={interviewNotes} onChange={setInterviewNotes} minHeight={120} /><div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}><button onClick={handleInterviewAnalyze} disabled={loading || !selectedInterviewProfile} style={{ ...secondaryButton, borderColor: tone.accent, color: tone.color }}>Сгенерировать</button><button onClick={saveInterview} disabled={loading || !selectedInterviewProfile} style={secondaryButton}>Сохранить набор</button><button onClick={exportInterviewToWord} disabled={loading || (!selectedInterviewProfile && interviewResult.competency.length === 0)} style={secondaryButton}>Скачать вопросы в Word</button></div><div>{interviewResult.competency.map((item, index) => <div key={`${item.question}-${index}`} style={{ padding: 12, borderRadius: 14, background: '#f8fafc', border: '1px solid #e2e8f0', marginBottom: 10 }}><div style={{ fontSize: 12, color: tone.color, fontWeight: 700 }}>{item.competency || 'Компетенция'}</div><div style={{ marginTop: 6, fontWeight: 700 }}>{item.question || 'Вопрос не указан'}</div><div style={{ marginTop: 4, fontSize: 13, color: '#64748b' }}>{item.whatLookingFor || 'Подсказка не указана'}</div></div>)}</div></div></Card> : null}
           </div>
 
           <div style={{ display: 'grid', gap: 16 }}>
             <Card title="Быстрый просмотр" subtitle="Содержимое текущей вкладки">{activeTab === 'parse' ? <div><div style={{ fontWeight: 700 }}>{resumeDraft.candidateName || 'Кандидат не определён'}</div><div style={{ marginTop: 6, color: '#64748b' }}>{resumeDraft.position || 'Должность не определена'}</div><div style={{ marginTop: 10 }}>{resumeDraft.summary || 'После анализа здесь появится краткая сводка.'}</div></div> : null}{activeTab === 'profile' ? <div><div style={{ fontWeight: 700 }}>{profileDraft.title || 'Профиль не сформирован'}</div><div style={{ marginTop: 6, color: '#64748b' }}>{profileDraft.department || 'Департамент не указан'}</div><div style={{ marginTop: 10 }}>{profileDraft.purpose || 'После генерации здесь появится цель роли.'}</div></div> : null}{activeTab === 'score' ? <div><div style={{ fontWeight: 700 }}>{scoreResult.verdict || 'Оценка не выполнена'}</div><div style={{ marginTop: 6, color: '#64748b' }}>{scoreResult.overallScore || 0}/100</div><div style={{ marginTop: 10 }}>{scoreResult.pros.map((item) => <div key={item}>• {item}</div>)}</div></div> : null}{activeTab === 'interview' ? <div>{interviewResult.situational.map((item) => <div key={item} style={{ marginBottom: 8 }}>• {item}</div>)}</div> : null}</Card>
-            <Card title="Сохранённое недавно" subtitle="Последние записи из базы">{activeTab === 'score' ? evaluations.slice(0, 5).map((item) => <div key={item.id} style={{ marginBottom: 10 }}><div style={{ fontWeight: 700 }}>{item.verdict || 'Без вердикта'} · {item.overallScore || 0}/100</div><div style={{ fontSize: 12, color: '#64748b' }}>{formatStamp(item.createdAt)}</div></div>) : interviews.slice(0, 5).map((item) => <div key={item.id} style={{ marginBottom: 10 }}><div style={{ fontWeight: 700 }}>{profiles.find((profile) => profile.id === item.profileId)?.title || 'Профиль удалён'}</div><div style={{ fontSize: 12, color: '#64748b' }}>{formatStamp(item.createdAt)}</div></div>)}</Card>
+            <Card title="Сохранённое недавно" subtitle="Последние записи из базы">{activeTab === 'score' ? evaluations.slice(0, 5).map((item) => <div key={item.id} style={{ marginBottom: 10 }}><div style={{ fontWeight: 700 }}>{item.verdict || 'Без вердикта'} · {item.overallScore || 0}/100</div><div style={{ fontSize: 12, color: '#64748b' }}>{formatStamp(item.createdAt)}</div></div>) : interviews.slice(0, 5).map((item) => <div key={item.id} style={{ marginBottom: 10 }}><div style={{ fontWeight: 700 }}>{profiles.find((profile) => profile.id === item.profileId)?.title || 'Профиль удалён'}</div><div style={{ fontSize: 12, color: '#64748b' }}>{formatStamp(item.createdAt)}</div></div>)}</Card><Card title="Итоговое саммари кандидата" subtitle="Готовая HR-сводка по кандидату">{candidateSummary.fullName || candidateSummary.summary ? <div style={{ fontSize: 14, lineHeight: 1.6, color: '#334155' }}><div><strong>ФИО:</strong> {candidateSummary.fullName || 'Не указано'}</div><div><strong>Должность:</strong> {candidateSummary.position || 'Не указана'}</div><div><strong>Зарплата:</strong> {candidateSummary.salary || 'Не указана'}</div><div style={{ marginTop: 8 }}><strong>Навыки:</strong> {candidateSummary.skills.length ? candidateSummary.skills.join(', ') : 'Не указаны'}</div><div style={{ marginTop: 8 }}><strong>Оценка:</strong> {candidateSummary.verdict || 'Не рассчитана'} · {candidateSummary.score || 0}/100</div><div style={{ marginTop: 8 }}><strong>Рекомендации:</strong></div>{candidateSummary.recommendations.length ? candidateSummary.recommendations.map((item) => <div key={item}>• {item}</div>) : <div>Не указаны</div>}<div style={{ marginTop: 8 }}><strong>Заметки HR:</strong> {candidateSummary.hrNotes || 'Не указаны'}</div></div> : <div style={{ color: '#94a3b8', fontSize: 13 }}>После оценки кандидата здесь появится полное саммари для HR.</div>}</Card>
           </div>
         </div>
       </div>
     </div>
   );
 }
-
